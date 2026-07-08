@@ -1,0 +1,8 @@
+# Environment variables (contains the home server's Tailscale IP)
+.env
+
+# Rendered dynamic config — generated from traefik-data/templates/*.tmpl at startup
+traefik-data/dynamic/*.yml
+
+# Logs
+*.log

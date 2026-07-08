@@ -1,0 +1,43 @@
+# TEMPLATE — do not edit the rendered copy in ../dynamic/poly.yml by hand.
+# On `docker compose up`, the `config` service renders this file into
+# ../dynamic/poly.yml, filling the HOME_SERVER and DOMAIN placeholders from .env
+# (the domain's dots are escaped as [.] so they stay literal in the regex rules).
+#
+# Routes all *.DOMAIN traffic to the home server over Tailscale.
+# TLS is terminated on the home server (certs via DNS-01 challenge), so this VPS
+# does pure TLS passthrough: it forwards the raw encrypted stream and never
+# decrypts anything. Routing is done off the TLS ClientHello SNI.
+
+tcp:
+  routers:
+    poly-passthrough:
+      entryPoints:
+        - websecure
+      # Match any subdomain of $DOMAIN via the SNI in the TLS handshake
+      rule: 'HostSNIRegexp(`^.+\.__DOMAIN__$`)'
+      tls:
+        passthrough: true
+      service: home-server
+
+  services:
+    home-server:
+      loadBalancer:
+        servers:
+          - address: "__HOME_SERVER__:443"
+
+# Optional: forward plain HTTP on :80 to the home server so that http:// links
+# still work (the home server issues the redirect to https). Plain HTTP has no
+# SNI, so this matches on the HTTP Host header instead. Remove this block if you
+# only want to serve HTTPS.
+http:
+  routers:
+    poly-http:
+      entryPoints:
+        - web
+      rule: 'HostRegexp(`^.+\.__DOMAIN__$`)'
+      service: home-http
+  services:
+    home-http:
+      loadBalancer:
+        servers:
+          - url: "http://__HOME_SERVER__:80"

@@ -1,0 +1,62 @@
+services:
+  # Renders traefik-data/templates/poly.yml.tmpl -> traefik-data/dynamic/poly.yml,
+  # substituting HOME_SERVER and DOMAIN (from .env) for the __HOME_SERVER__ and
+  # __DOMAIN__ placeholders. DOMAIN's dots are escaped as [.] so it stays a
+  # literal match inside the Host*Regexp rules. Runs once before Traefik starts.
+  # Keeps the real Tailscale IP and domain out of the committed repo — only .env
+  # holds them.
+  config:
+    image: busybox:stable
+    container_name: traefik-config-render
+    command:
+      - sh
+      - -c
+      - 'DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__HOME_SERVER__|$$HOME_SERVER|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
+    environment:
+      HOME_SERVER: ${HOME_SERVER:?set HOME_SERVER in .env (copy .env.example)}
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env (copy .env.example)}
+    volumes:
+      - ./traefik-data/templates:/templates:ro
+      - ./traefik-data/dynamic:/dynamic
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    depends_on:
+      config:
+        condition: service_completed_successfully
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+      # Dashboard bound to localhost only — reach it via an SSH tunnel:
+      #   ssh -L 8080:localhost:8080 your-vps   then open http://localhost:8080
+      - "127.0.0.1:8080:8080"
+    command:
+      # API / Dashboard (exposed on :8080, published to 127.0.0.1 only above)
+      - --api.dashboard=true
+      - --api.insecure=true
+
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+
+      # File provider — routing lives in ./traefik-data/dynamic
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+
+      # Logging
+      - --log.level=INFO
+      - --accesslog=true
+    volumes:
+      - ./traefik-data/dynamic:/etc/traefik/dynamic:ro
+
+# NOTE: This box does pure TLS passthrough to the home server, so there is no
+# docker provider, no ACME/Let's Encrypt, and no certificate storage here.
+# TLS is terminated on the home server (DNS-01 certs).
+#
+# If the container cannot reach your tailnet (100.x addresses) from the default
+# bridge network, switch to host networking: remove the `ports:` block above and
+# add `network_mode: host`.
