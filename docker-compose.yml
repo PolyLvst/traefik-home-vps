@@ -53,6 +53,46 @@ services:
     volumes:
       - ./traefik-data/dynamic:/etc/traefik/dynamic:ro
 
+  # CrowdSec engine (the "brain"): reads logs, runs detection scenarios, and
+  # pulls the community blocklist. It does NOT block traffic itself — that's the
+  # host firewall-bouncer's job (installed separately; see README "CrowdSec").
+  #
+  # NOTE: this box does pure TLS passthrough, so Traefik never sees decrypted
+  # HTTP. That means CrowdSec here can't do L7 web-attack detection — it's used
+  # as an edge blocklist (community IPs) plus SSH brute-force detection from the
+  # host's auth log. Save the Traefik-log/L7 detection for the home server, where
+  # TLS is actually terminated.
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Pulled on first start: SSH brute-force + base linux scenarios.
+      COLLECTIONS: "crowdsecurity/sshd crowdsecurity/linux"
+      # Optional: enroll this engine in the CrowdSec console (app.crowdsec.net)
+      # for a web UI. Put the key in .env, then uncomment:
+      # ENROLL_INSTANCE_NAME: "traefik-vps"
+      # ENROLL_KEY: ${CROWDSEC_ENROLL_KEY:?}
+    volumes:
+      # Host SSH auth log, read-only, so the sshd collection can spot brute-force.
+      # Debian/Ubuntu path — on journald-only hosts this file won't exist (see README).
+      - /var/log/auth.log:/var/log/auth.log:ro
+      # Custom acquisition (dropped into acquis.d so the image's defaults survive).
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.d/ssh.yaml:ro
+      # Persist config (registered bouncers + local creds) and the decisions DB.
+      - crowdsec-config:/etc/crowdsec
+      - crowdsec-data:/var/lib/crowdsec/data
+    ports:
+      # Local API, localhost-only. The host firewall-bouncer connects here.
+      # Published as 8081, NOT 8080 — 8080 is taken by the Traefik dashboard.
+      - "127.0.0.1:8081:8080"
+
+volumes:
+  crowdsec-config:
+  crowdsec-data:
+
 # NOTE: This box does pure TLS passthrough to the home server, so there is no
 # docker provider, no ACME/Let's Encrypt, and no certificate storage here.
 # TLS is terminated on the home server (DNS-01 certs).

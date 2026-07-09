@@ -1,0 +1,12 @@
+# Acquisition for the CrowdSec engine (mounted into /etc/crowdsec/acquis.d/).
+#
+# Feeds the host's SSH auth log to CrowdSec so the crowdsecurity/sshd collection
+# can detect brute-force and hand the offending IPs to the firewall bouncer.
+#
+# Debian/Ubuntu write SSH events to /var/log/auth.log. If your VPS is journald-
+# only (some minimal Ubuntu/RHEL images, no rsyslog), this file won't exist —
+# see the README for the journalctl-based alternative.
+filenames:
+  - /var/log/auth.log
+labels:
+  type: syslog

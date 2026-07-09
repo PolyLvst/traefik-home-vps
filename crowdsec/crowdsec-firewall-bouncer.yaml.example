@@ -1,0 +1,47 @@
+# Host firewall-bouncer config — REFERENCE COPY.
+#
+# The bouncer runs on the VPS host (not in Docker), because only the host kernel
+# can drop packets. Install it, then copy the settings below into the file apt
+# created at:  /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+# and restart:  sudo systemctl restart crowdsec-firewall-bouncer
+#
+# See the README "CrowdSec (Option 2)" section for the full install steps.
+
+mode: nftables
+update_frequency: 10s
+log_mode: file
+log_dir: /var/log/
+log_level: info
+
+# The CrowdSec engine runs in Docker with its Local API published on
+# 127.0.0.1:8081 (see docker-compose.yml). Point the bouncer at it.
+api_url: http://127.0.0.1:8081/
+# Generated on the host with:
+#   docker compose exec crowdsec cscli bouncers add firewall-bouncer-host
+api_key: <PASTE_KEY_HERE>
+
+# Drop silently rather than reject.
+deny_action: DROP
+
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+  ipv6:
+    enabled: true
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain
+
+# CRITICAL FOR DOCKER. Traffic to published container ports (Traefik's 80/443)
+# is forwarded to the container — it traverses the `forward` path, NOT `input`.
+# A default bouncer only hooks `input`, so it would block SSH on the host but
+# silently let web attacks reach Traefik. Adding `forward` fixes that.
+#
+# (On an iptables-based host instead of nftables: set `mode: iptables` and add
+#  `DOCKER-USER` to `iptables_chains` — same idea, different backend.)
+nftables_hooks:
+  - input
+  - forward
