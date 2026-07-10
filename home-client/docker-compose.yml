@@ -1,0 +1,35 @@
+# Runs ON THE HOME SERVER (not the VPS). Dials OUT to the VPS over wss/443 and
+# opens a reverse tunnel so the VPS Traefik can reach this box's Traefik :443.
+#
+# Prereqs on this box:
+#   - home-client.crt + home-client.key present (see ../traefik-data/mtls/README.md)
+#   - this box's own Traefik/web server is listening on 127.0.0.1:443
+#
+# Fill these in a .env next to this file:
+#   TUNNEL_SECRET   – must equal the VPS's TUNNEL_SECRET
+#   TUNNEL_HOST     – wstunnel.poly.my.id
+services:
+  wstunnel:
+    image: ghcr.io/erebe/wstunnel:v10.1.6   # match the VPS tag
+    container_name: wstunnel-client
+    restart: unless-stopped
+    # host networking so `127.0.0.1:443` below reaches this box's own Traefik.
+    network_mode: host
+    volumes:
+      - ./home-client.crt:/certs/home-client.crt:ro
+      - ./home-client.key:/certs/home-client.key:ro
+    command:
+      # ENTRYPOINT is just dumb-init, so start the command with the binary's
+      # ABSOLUTE path (it isn't on $PATH). Confirm with:
+      #   docker inspect ghcr.io/erebe/wstunnel:TAG --format '{{json .Config.Cmd}}'
+      - /home/app/wstunnel
+      - client
+      - --http-upgrade-path-prefix=${TUNNEL_SECRET:?set TUNNEL_SECRET}
+      # Client certificate for the VPS's edge mTLS (mtls-tunnel router).
+      - --tls-certificate=/certs/home-client.crt
+      - --tls-private-key=/certs/home-client.key
+      # Reverse tunnel: VPS-side wstunnel binds 0.0.0.0:8443 and forwards each
+      # connection back here, where the client dials 127.0.0.1:443 (home Traefik).
+      - -R
+      - tcp://0.0.0.0:8443:127.0.0.1:443
+      - wss://${TUNNEL_HOST:?set TUNNEL_HOST}:443

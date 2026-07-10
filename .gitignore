@@ -1,8 +1,16 @@
-# Environment variables (contains the home server's Tailscale IP)
+# Environment variables (domain, ACME/DNS tokens, tunnel + CrowdSec secrets)
 .env
 
 # Rendered dynamic config — generated from traefik-data/templates/*.tmpl at startup
 traefik-data/dynamic/*.yml
+
+# mTLS material for the wstunnel router. The Certificate Authority (CA) cert is
+# public, but never let a stray private key (*.key) get committed — ignore the
+# whole dir EXCEPT its README, so the how-to doc still travels with the repo.
+traefik-data/mtls/*
+!traefik-data/mtls/README.md
+home-client/*.crt
+home-client/*.key
 
 # Logs
 *.log

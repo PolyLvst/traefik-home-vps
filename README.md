@@ -2,15 +2,20 @@
 
 A public-facing Traefik entrypoint (runs on a VPS) that **terminates TLS**,
 runs edge security (geofencing + CrowdSec L7), and **re-encrypts** all
-`*.<your-domain>` traffic to a home server reachable over Tailscale. The domain
-and the home server's IP are set in `.env`.
+`*.<your-domain>` traffic to a home server reached over a **wstunnel reverse
+tunnel** (TCP/443). The domain and tunnel secrets are set in `.env`.
 
 ```
-client ──TLS#1──▶ VPS Traefik (:443) ─────────────▶ home server (Tailscale, :443)
-                  terminates TLS,       TLS#2         terminates TLS again
-                  geofence + CrowdSec   (re-encrypt)  + serves apps
+client ──TLS#1──▶ VPS Traefik (:443) ─────────────▶ wstunnel:8443 ═══reverse tunnel═══▶ home Traefik (:443)
+                  terminates TLS,       TLS#2         (wss/443 to    terminates TLS again
+                  geofence + CrowdSec   (re-encrypt)   the home box)  + serves apps
 ```
 
+- **Why not Tailscale?** The home ISP heavily throttles UDP, so Tailscale/
+  WireGuard collapses on the home↔VPS leg (it establishes a "direct" UDP path
+  that then gets policed). Plain TCP/443 is untouched, so the home box instead
+  dials OUT to `wstunnel.DOMAIN` over `wss` and opens a **reverse
+  tunnel**; Traefik reaches home through `wstunnel:8443`.
 - **TLS bridging (double TLS):** the VPS terminates the client's TLS so it can
   inspect L7, then opens a *second* TLS connection to the home server (which
   still terminates its own TLS). The VPS holds a wildcard `*.DOMAIN` cert from
@@ -18,8 +23,11 @@ client ──TLS#1──▶ VPS Traefik (:443) ───────────
 - **Geofencing** (GeoBlock plugin) and **CrowdSec L7** (bouncer plugin + Traefik
   access-log scenarios) run as middleware on the decrypted request — see
   [Edge security](#edge-security-geofencing--crowdsec-l7).
-- The VPS→home hop rides inside Tailscale (WireGuard), so TLS#2 is about letting
-  the home server keep its own certs, not about confidentiality on that hop.
+- **Tunnel auth:** the `wstunnel.DOMAIN` router enforces **edge mTLS** — only the
+  home box's client certificate can open the tunnel. That certificate is signed
+  by your own **Certificate Authority (CA)**, a trust anchor you generate once and
+  keep offline; Traefik trusts the CA and rejects any cert it didn't sign. A
+  shared-secret path prefix adds defence-in-depth on top.
 
 > **Prefer a thin, blind forwarder?** If you don't need edge L7, the simpler
 > pure **TLS-passthrough** design (route on SNI, never decrypt, no certs on the
@@ -32,20 +40,23 @@ client ──TLS#1──▶ VPS Traefik (:443) ───────────
    ```bash
    cp .env.example .env      # then edit .env:
    #   DOMAIN=poly.my.id
-   #   HOME_SERVER=100.x.y.z
+   #   TUNNEL_SECRET=...              # openssl rand -hex 32 (match on home client)
    #   ACME_EMAIL=you@example.com     # Let's Encrypt account
    #   CF_DNS_API_TOKEN=...           # Cloudflare token for the DNS-01 wildcard
    #   GEO_BLACKLIST=false            # false=allowlist, true=blocklist
    #   GEO_COUNTRIES=ID               # ISO codes, e.g. "ID, SG"
-   #   CROWDSEC_LAPI_KEY=...          # filled in after step 5 below
+   #   CROWDSEC_LAPI_KEY=...          # filled in after step 4 below
    ```
-2. **DNS** — point `*.DOMAIN` at this VPS's public IP. The wildcard cert is
-   issued via **DNS-01**, so you also need a DNS provider API token
-   (`CF_DNS_API_TOKEN` for Cloudflare; to use another provider, change the
-   resolver's `provider` in `docker-compose.yml` and set that provider's env
-   vars — see the [lego docs](https://go-acme.github.io/lego/dns/)).
-3. **Tailscale** — put this VPS on the same tailnet as the home server
-   (`tailscale up`); `HOME_SERVER` is that server's Tailscale IP (`100.x.y.z`).
+2. **DNS** — point `*.DOMAIN` (which covers `wstunnel.DOMAIN`) at this
+   VPS's public IP. The wildcard cert is issued via **DNS-01**, so you also need
+   a DNS provider API token (`CF_DNS_API_TOKEN` for Cloudflare; to use another
+   provider, change the resolver's `provider` in `docker-compose.yml` and set
+   that provider's env vars — see the [lego docs](https://go-acme.github.io/lego/dns/)).
+3. **Tunnel mTLS** — generate a CA + home client cert and place **only** the CA
+   cert at `traefik-data/mtls/tunnel-ca.crt` (commands in
+   [`traefik-data/mtls/README.md`](traefik-data/mtls/README.md)). The home box
+   runs the wstunnel client from [`home-client/`](home-client/docker-compose.yml)
+   with the matching `home-client.crt`/`.key` and the same `TUNNEL_SECRET`.
 4. **Create the CrowdSec bouncer key** — the config render needs it, so bring up
    the engine first, mint the key, and paste it into `.env`:
    ```bash
@@ -62,18 +73,19 @@ client ──TLS#1──▶ VPS Traefik (:443) ───────────
 ## How the config is built
 
 The routing rules live in `traefik-data/templates/poly.yml.tmpl` (committed, with
-`__DOMAIN__` and `__HOME_SERVER__` placeholders). On `docker compose up`, a
-one-shot `config` container renders that template into
-`traefik-data/dynamic/poly.yml`, filling in `DOMAIN` and `HOME_SERVER` from
-`.env` (the domain's dots are escaped as `[.]` so they stay literal inside the
-regex rules). Traefik's file provider then loads the dynamic dir and watches it.
+`__DOMAIN__` placeholders). On `docker compose up`, a one-shot `config` container
+renders that template into `traefik-data/dynamic/poly.yml`, filling in `DOMAIN`
+from `.env` (the domain's dots are escaped as `[.]` so they stay literal inside
+the regex rules). Traefik's file provider then loads the dynamic dir and watches
+it. The home-server hop is no longer a Tailscale IP — the template points it at
+the fixed `https://wstunnel:8443` reverse-tunnel endpoint.
 
-This keeps the real domain and Tailscale IP out of version control — only `.env`
+This keeps the real domain and secrets out of version control — only `.env`
 (git-ignored) holds them, so the repo is safe to publish.
 
 - Edit routing in **`traefik-data/templates/poly.yml.tmpl`**, not the rendered
   `traefik-data/dynamic/poly.yml` (git-ignored and overwritten on every `up`).
-- Change the domain or IP in **`.env`**, then `docker compose up -d` to re-render.
+- Change the domain in **`.env`**, then `docker compose up -d` to re-render.
 
 ## Adding more routes
 
@@ -96,8 +108,8 @@ request (defined in `traefik-data/templates/poly.yml.tmpl`):
   `GEO_BLACKLIST=false` makes `GEO_COUNTRIES` an **allowlist** (only those
   countries connect); `=true` makes it a **blocklist**. Country lookups use the
   free geojs.io API with an in-memory cache. The real client IP is used directly
-  (this VPS is the internet edge), and `allowLocalRequests: true` keeps your
-  tailnet/localhost exempt.
+  (this VPS is the internet edge), and `allowLocalRequests: true` keeps
+  localhost/private-range requests exempt.
 - **`crowdsec`** — the [CrowdSec bouncer plugin](https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin)
   in `live` mode. Each request's IP is checked against the CrowdSec engine's
   decisions (community blocklist + scenarios fired from Traefik's access log via
@@ -187,10 +199,15 @@ sudo nft list set ip crowdsec crowdsec-blacklists        # 203.0.113.10 appears
 
 ## Troubleshooting
 
-- **Can't reach the tailnet from the container** — if `100.x` addresses aren't
-  reachable from the default bridge network, switch to host networking in
-  `docker-compose.yml` (remove the `ports:` block, add `network_mode: host`).
-- **502 / connection refused** — confirm the home server is listening on `:443`
-  for that Tailscale IP and that Tailscale ACLs let the VPS reach it.
+- **502 / connection refused on `*.DOMAIN`** — the reverse listener
+  `wstunnel:8443` only exists while the home client is connected. Check the home
+  box: `docker compose logs -f wstunnel` in `home-client/`, confirm it's dialing
+  `wss://wstunnel.DOMAIN:443` and that home's own Traefik is up on `:443`.
+- **Tunnel handshake rejected (TLS alert / 400)** — usually mTLS: the home
+  client cert isn't signed by the CA in `traefik-data/mtls/tunnel-ca.crt`, or the
+  `TUNNEL_SECRET` path prefix differs between the two ends.
+- **Home client can't connect at all** — verify DNS for `wstunnel.DOMAIN`
+  resolves to the VPS and that TCP/443 is open end-to-end (this is the whole
+  point — it's the path the ISP does *not* throttle).
 - **Traefik starts with no routes** — check the render step:
   `docker compose logs config` and confirm `traefik-data/dynamic/poly.yml` exists.

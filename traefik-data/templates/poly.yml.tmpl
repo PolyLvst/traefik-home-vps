@@ -3,7 +3,6 @@
 # ../dynamic/poly.yml, filling these placeholders from .env:
 #   __DOMAIN__          domain with dots escaped as [.]  (for the HostRegexp rules)
 #   __DOMAIN_RAW__      raw domain                       (for the wildcard cert SANs)
-#   __HOME_SERVER__     home server Tailscale IP
 #   __GEO_BLACKLIST__   false = allowlist / true = blocklist   (GeoBlock)
 #   __GEO_COUNTRIES__   comma-separated ISO codes               (GeoBlock, flow list)
 #   __CROWDSEC_LAPI_KEY__  bouncer API key for the CrowdSec plugin
@@ -12,9 +11,33 @@
 # checks (geofence + CrowdSec), then opens a SECOND TLS connection to the home
 # server (which still terminates its own TLS). The VPS holds a wildcard cert for
 # *.DOMAIN (Let's Encrypt via DNS-01); the home server keeps its own certs.
+#
+# The second hop no longer rides Tailscale. The home box dials OUT to
+# wstunnel.DOMAIN (wss/443) and opens a reverse tunnel; Traefik reaches
+# home through wstunnel:8443. The tunnel router below is locked with edge mTLS
+# (see the `tls.options` block at the bottom) so only the home client's cert can
+# establish it.
 
 http:
   routers:
+    # wstunnel control plane. The home client connects here over wss/443; Traefik
+    # terminates TLS, REQUIRES a valid client cert (mtls-tunnel options), then
+    # forwards the plain-ws upgrade to the wstunnel server container. Higher
+    # priority than the `poly` catch-all below, whose HostRegexp would otherwise
+    # also match this host. No CrowdSec here: it's a single long-lived upgrade
+    # from a known peer, already pinned by mTLS.
+    wstunnel:
+      entryPoints:
+        - websecure
+      rule: 'Host(`wstunnel.__DOMAIN_RAW__`)'
+      priority: 100
+      middlewares:
+        - geo-allow
+      service: wstunnel
+      tls:
+        certResolver: le
+        options: mtls-tunnel
+
     # All *.DOMAIN over HTTPS: terminate TLS here, geo-check, CrowdSec-check,
     # then re-encrypt to the home server.
     poly:
@@ -67,16 +90,39 @@ http:
           crowdsecLapiKey: "__CROWDSEC_LAPI_KEY__"
 
   services:
+    # WebSocket upgrade target for the tunnel control plane. `http` scheme — Traefik
+    # transparently handles the ws upgrade; TLS/mTLS were already terminated at the
+    # edge, so wstunnel listens plaintext ws on :8080 inside its container.
+    wstunnel:
+      loadBalancer:
+        servers:
+          - url: "http://wstunnel:8080"
+
     home-server:
       loadBalancer:
-        # Re-encrypt to the home server, which terminates its own TLS on :443.
+        # Re-encrypt to the home server, reached through the wstunnel reverse
+        # listener (wstunnel:8443 -> tunnel -> home Traefik :443), which still
+        # terminates its own TLS.
         servers:
-          - url: "https://__HOME_SERVER__:443"
+          - url: "https://wstunnel:8443"
         serversTransport: home-tls
 
   serversTransports:
-    # The hop to the home server rides inside Tailscale (already WireGuard-
-    # encrypted), and the home server presents its own cert for its own names,
-    # so we don't verify it from here.
+    # The hop to the home server rides inside the wstunnel WebSocket (TLS on the
+    # wire to the edge), and the home server presents its own cert for its own
+    # names, so we don't verify it from here.
     home-tls:
       insecureSkipVerify: true
+
+# Edge mTLS for the wstunnel router: Traefik requires and verifies a client
+# certificate signed by our private Certificate Authority (CA) — the trust
+# anchor we generate ourselves — before completing the TLS handshake on
+# wstunnel.DOMAIN. The CA cert is mounted at /etc/traefik/mtls (see
+# docker-compose.yml); the matching client cert+key live only on the home box.
+tls:
+  options:
+    mtls-tunnel:
+      clientAuth:
+        caFiles:
+          - /etc/traefik/mtls/tunnel-ca.crt
+        clientAuthType: RequireAndVerifyClientCert

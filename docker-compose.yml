@@ -9,15 +9,18 @@ services:
   #
   # NOTE: __DOMAIN_RAW__ is substituted BEFORE __DOMAIN__ (it contains __DOMAIN__
   # as a substring, so the order matters).
+  #
+  # The hop to the home server no longer rides Tailscale — Traefik now reaches it
+  # through the wstunnel reverse tunnel (see the wstunnel service below), so
+  # HOME_SERVER is gone and poly.yml points home-server at https://wstunnel:8443.
   config:
     image: busybox:stable
     container_name: traefik-config-render
     command:
       - sh
       - -c
-      - 'if [ -z "$$CROWDSEC_LAPI_KEY" ]; then echo "WARNING: CROWDSEC_LAPI_KEY is empty — the Traefik CrowdSec bouncer will fail to authenticate. Create it with: docker compose exec crowdsec cscli bouncers add traefik-plugin ; put it in .env, then re-run." >&2; fi; DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__HOME_SERVER__|$$HOME_SERVER|g" -e "s|__DOMAIN_RAW__|$$DOMAIN|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" -e "s|__GEO_BLACKLIST__|$$GEO_BLACKLIST|g" -e "s|__GEO_COUNTRIES__|$$GEO_COUNTRIES|g" -e "s|__CROWDSEC_LAPI_KEY__|$$CROWDSEC_LAPI_KEY|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
+      - 'if [ -z "$$CROWDSEC_LAPI_KEY" ]; then echo "WARNING: CROWDSEC_LAPI_KEY is empty — the Traefik CrowdSec bouncer will fail to authenticate. Create it with: docker compose exec crowdsec cscli bouncers add traefik-plugin ; put it in .env, then re-run." >&2; fi; DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__DOMAIN_RAW__|$$DOMAIN|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" -e "s|__GEO_BLACKLIST__|$$GEO_BLACKLIST|g" -e "s|__GEO_COUNTRIES__|$$GEO_COUNTRIES|g" -e "s|__CROWDSEC_LAPI_KEY__|$$CROWDSEC_LAPI_KEY|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
     environment:
-      HOME_SERVER: ${HOME_SERVER:?set HOME_SERVER in .env (copy .env.example)}
       DOMAIN: ${DOMAIN:?set DOMAIN in .env (copy .env.example)}
       GEO_BLACKLIST: ${GEO_BLACKLIST:-false}
       GEO_COUNTRIES: ${GEO_COUNTRIES:?set GEO_COUNTRIES in .env (copy .env.example)}
@@ -102,10 +105,50 @@ services:
       CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN:?set CF_DNS_API_TOKEN in .env}
     volumes:
       - ./traefik-data/dynamic:/etc/traefik/dynamic:ro
+      # mTLS trust anchor for the wstunnel router: Traefik verifies the home
+      # client's certificate against this Certificate Authority (CA) before it
+      # may open the tunnel. Only the CA cert (public) lives here — the CA's
+      # signing key and the client key never touch the VPS.
+      - ./traefik-data/mtls:/etc/traefik/mtls:ro
       # ACME cert storage (acme.json is created here on first run).
       - ./traefik-data/letsencrypt:/letsencrypt
       # Access log, shared read-only with the CrowdSec engine.
       - traefik-logs:/var/log/traefik
+
+  # wstunnel server: the VPS end of the reverse tunnel to the home server.
+  #
+  # The home ISP heavily throttles UDP, so Tailscale/WireGuard (UDP) is unusable
+  # on the home↔VPS leg. Instead the home box runs a wstunnel CLIENT that dials
+  # OUT to wss://wstunnel.DOMAIN:443 (plain TCP/443 — not throttled), and
+  # asks this server to open a REVERSE listener on wstunnel:8443 that forwards
+  # back through the WebSocket to home's own Traefik :443. Traefik's home-server
+  # service then targets https://wstunnel:8443 instead of the old Tailscale IP.
+  #
+  # No ports are published: the ws control plane is reached only via Traefik
+  # (Host(`wstunnel.DOMAIN`) -> http://wstunnel:8080, TLS + mTLS enforced
+  # at the edge), and the reverse listener is reached only by Traefik over the
+  # compose network as wstunnel:8443. Nothing here faces the internet directly.
+  wstunnel:
+    image: ghcr.io/erebe/wstunnel:v10.1.6   # pin a real tag; check for updates
+    container_name: wstunnel
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      # The image's ENTRYPOINT is just dumb-init, so our command must start with
+      # the wstunnel binary's ABSOLUTE path (it isn't on $PATH; overriding command
+      # drops the image's default CMD that used to supply it). Confirm with:
+      #   docker inspect ghcr.io/erebe/wstunnel:TAG --format '{{json .Config.Cmd}}'
+      - /home/app/wstunnel
+      - server
+      # Plaintext ws — Traefik terminates TLS (and mTLS) in front of us.
+      - ws://0.0.0.0:8080
+      # Shared-secret path prefix (defence-in-depth on top of edge mTLS): the
+      # client must request /$${TUNNEL_SECRET} or the upgrade is rejected.
+      - --restrict-http-upgrade-path-prefix=${TUNNEL_SECRET:?set TUNNEL_SECRET in .env (copy .env.example)}
+    depends_on:
+      config:
+        condition: service_completed_successfully
 
   # CrowdSec engine (the "brain"): reads logs, runs detection scenarios, and
   # pulls the community blocklist. Enforcement happens in two places: the
