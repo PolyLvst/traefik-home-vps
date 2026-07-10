@@ -1,36 +1,62 @@
 # traefik-home-vps
 
-A public-facing Traefik entrypoint (runs on a VPS) that **TLS-passthroughs** all
+A public-facing Traefik entrypoint (runs on a VPS) that **terminates TLS**,
+runs edge security (geofencing + CrowdSec L7), and **re-encrypts** all
 `*.<your-domain>` traffic to a home server reachable over Tailscale. The domain
 and the home server's IP are set in `.env`.
 
 ```
-client ──TLS──▶ VPS Traefik (:443) ──raw TLS stream──▶ home server (Tailscale, :443)
-                 routes on SNI                          terminates TLS + serves apps
+client ──TLS#1──▶ VPS Traefik (:443) ─────────────▶ home server (Tailscale, :443)
+                  terminates TLS,       TLS#2         terminates TLS again
+                  geofence + CrowdSec   (re-encrypt)  + serves apps
 ```
 
-- TLS is **terminated on the home server**, which holds the certificates (issued
-  via a DNS-01 challenge). This VPS never decrypts traffic and needs no certs.
-- Traefik routes purely on the **SNI** in the TLS ClientHello, so any
-  `*.DOMAIN` hostname is forwarded to the home server, which decides what to do
-  with it.
-- No ACME, no docker socket — just a thin, low-attack-surface forwarder.
+- **TLS bridging (double TLS):** the VPS terminates the client's TLS so it can
+  inspect L7, then opens a *second* TLS connection to the home server (which
+  still terminates its own TLS). The VPS holds a wildcard `*.DOMAIN` cert from
+  Let's Encrypt (DNS-01); the home server keeps its own certs.
+- **Geofencing** (GeoBlock plugin) and **CrowdSec L7** (bouncer plugin + Traefik
+  access-log scenarios) run as middleware on the decrypted request — see
+  [Edge security](#edge-security-geofencing--crowdsec-l7).
+- The VPS→home hop rides inside Tailscale (WireGuard), so TLS#2 is about letting
+  the home server keep its own certs, not about confidentiality on that hop.
+
+> **Prefer a thin, blind forwarder?** If you don't need edge L7, the simpler
+> pure **TLS-passthrough** design (route on SNI, never decrypt, no certs on the
+> VPS) lives in this repo's history — that's what commit `c139391` and earlier
+> shipped.
 
 ## Setup
 
-1. **Configure** — set your domain and the home server's Tailscale IP:
+1. **Configure** — copy `.env.example` to `.env` and fill it in:
    ```bash
    cp .env.example .env      # then edit .env:
    #   DOMAIN=poly.my.id
    #   HOME_SERVER=100.x.y.z
+   #   ACME_EMAIL=you@example.com     # Let's Encrypt account
+   #   CF_DNS_API_TOKEN=...           # Cloudflare token for the DNS-01 wildcard
+   #   GEO_BLACKLIST=false            # false=allowlist, true=blocklist
+   #   GEO_COUNTRIES=ID               # ISO codes, e.g. "ID, SG"
+   #   CROWDSEC_LAPI_KEY=...          # filled in after step 5 below
    ```
-2. **DNS** — point `*.DOMAIN` at this VPS's public IP.
+2. **DNS** — point `*.DOMAIN` at this VPS's public IP. The wildcard cert is
+   issued via **DNS-01**, so you also need a DNS provider API token
+   (`CF_DNS_API_TOKEN` for Cloudflare; to use another provider, change the
+   resolver's `provider` in `docker-compose.yml` and set that provider's env
+   vars — see the [lego docs](https://go-acme.github.io/lego/dns/)).
 3. **Tailscale** — put this VPS on the same tailnet as the home server
    (`tailscale up`); `HOME_SERVER` is that server's Tailscale IP (`100.x.y.z`).
-4. **Run**
+4. **Create the CrowdSec bouncer key** — the config render needs it, so bring up
+   the engine first, mint the key, and paste it into `.env`:
+   ```bash
+   docker compose up -d crowdsec
+   docker compose exec crowdsec cscli bouncers add traefik-plugin   # copy the key
+   #   -> put it in .env as CROWDSEC_LAPI_KEY=...
+   ```
+5. **Run**
    ```bash
    docker compose up -d
-   docker compose logs -f traefik
+   docker compose logs -f traefik      # watch the cert issue + plugins load
    ```
 
 ## How the config is built
@@ -51,12 +77,36 @@ This keeps the real domain and Tailscale IP out of version control — only `.en
 
 ## Adding more routes
 
-Add another router to the template (it can reuse `__DOMAIN__`). To also pass
-through the bare apex `DOMAIN` (not just subdomains), widen the rule:
+Add another HTTP router to the template (it can reuse `__DOMAIN__`). To also
+serve the bare apex `DOMAIN` (not just subdomains), widen the rule:
 
 ```yaml
-rule: 'HostSNIRegexp(`^(.+\.)?__DOMAIN__$`)'
+rule: 'HostRegexp(`^(.+\.)?__DOMAIN__$`)'
 ```
+
+Attach the `geo-allow` and `crowdsec` middlewares to any new router that should
+get edge filtering.
+
+## Edge security (geofencing + CrowdSec L7)
+
+Because the VPS now decrypts traffic, two middlewares run on every `*.DOMAIN`
+request (defined in `traefik-data/templates/poly.yml.tmpl`):
+
+- **`geo-allow`** — the [GeoBlock plugin](https://github.com/PascalMinder/geoblock).
+  `GEO_BLACKLIST=false` makes `GEO_COUNTRIES` an **allowlist** (only those
+  countries connect); `=true` makes it a **blocklist**. Country lookups use the
+  free geojs.io API with an in-memory cache. The real client IP is used directly
+  (this VPS is the internet edge), and `allowLocalRequests: true` keeps your
+  tailnet/localhost exempt.
+- **`crowdsec`** — the [CrowdSec bouncer plugin](https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin)
+  in `live` mode. Each request's IP is checked against the CrowdSec engine's
+  decisions (community blocklist + scenarios fired from Traefik's access log via
+  the `crowdsecurity/traefik` collection). Banned IPs get a `403`.
+
+To change countries or switch allow/blocklist, edit `.env` and re-run
+`docker compose up -d` (re-renders the dynamic config). Reference: the geofence
+tradeoff (edge vs home box) and the passthrough-vs-bridging decision are why
+this box terminates TLS at all.
 
 ## Dashboard
 
@@ -68,14 +118,21 @@ ssh -L 8080:localhost:8080 your-vps    # then open http://localhost:8080
 
 ## CrowdSec (Option 2: engine in Docker, bouncer on host)
 
-CrowdSec has two halves: the **engine** (decides which IPs are bad — from the
-community blocklist and from SSH brute-force on this box) and the **firewall
-bouncer** (enforces the bans in the host firewall). Only the kernel can drop
-packets, so the bouncer *must* live on the host even though the engine runs in
-Docker — that split is the whole shape of Option 2.
+CrowdSec has an **engine** (decides which IPs are bad — from the community
+blocklist, SSH brute-force, and now L7 web-attack scenarios off Traefik's access
+log) and **bouncers** that enforce the bans. There are two bouncers here:
 
-Because this VPS does pure TLS passthrough, CrowdSec here is an **edge blocklist
-+ SSH protector**, not an L7 web firewall (Traefik never sees decrypted HTTP).
+- **CrowdSec bouncer plugin (in Traefik, L7):** already wired up as the
+  `crowdsec` middleware — checks each HTTP request and returns `403` for banned
+  IPs. This is what makes CrowdSec a real web firewall now that the VPS
+  terminates TLS. Its key is `CROWDSEC_LAPI_KEY` (created in Setup step 4).
+- **Firewall bouncer (on the host, L3/L4):** drops banned IPs at nftables before
+  they reach Traefik at all. Only the kernel can drop packets, so this one
+  *must* live on the host even though the engine runs in Docker. Install steps
+  below.
+
+The two are complementary: the firewall bouncer sheds load at the packet level;
+the plugin catches anything that reaches Traefik and gives clean `403`s.
 
 ### 1. Start the engine (in this compose stack)
 

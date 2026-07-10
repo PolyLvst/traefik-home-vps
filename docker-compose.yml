@@ -1,20 +1,34 @@
 services:
   # Renders traefik-data/templates/poly.yml.tmpl -> traefik-data/dynamic/poly.yml,
-  # substituting HOME_SERVER and DOMAIN (from .env) for the __HOME_SERVER__ and
-  # __DOMAIN__ placeholders. DOMAIN's dots are escaped as [.] so it stays a
-  # literal match inside the Host*Regexp rules. Runs once before Traefik starts.
-  # Keeps the real Tailscale IP and domain out of the committed repo — only .env
-  # holds them.
+  # substituting values from .env for the __PLACEHOLDER__ tokens. DOMAIN appears
+  # twice: __DOMAIN__ gets its dots escaped as [.] so it stays a literal match
+  # inside the HostRegexp rules, while __DOMAIN_RAW__ keeps the plain domain for
+  # the wildcard cert SANs. Runs once before Traefik starts. Keeps the real
+  # Tailscale IP, domain, and CrowdSec key out of the committed repo — only .env
+  # (git-ignored) holds them, and the rendered dynamic/ copy is git-ignored too.
+  #
+  # NOTE: __DOMAIN_RAW__ is substituted BEFORE __DOMAIN__ (it contains __DOMAIN__
+  # as a substring, so the order matters).
   config:
     image: busybox:stable
     container_name: traefik-config-render
     command:
       - sh
       - -c
-      - 'DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__HOME_SERVER__|$$HOME_SERVER|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
+      - 'if [ -z "$$CROWDSEC_LAPI_KEY" ]; then echo "WARNING: CROWDSEC_LAPI_KEY is empty — the Traefik CrowdSec bouncer will fail to authenticate. Create it with: docker compose exec crowdsec cscli bouncers add traefik-plugin ; put it in .env, then re-run." >&2; fi; DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__HOME_SERVER__|$$HOME_SERVER|g" -e "s|__DOMAIN_RAW__|$$DOMAIN|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" -e "s|__GEO_BLACKLIST__|$$GEO_BLACKLIST|g" -e "s|__GEO_COUNTRIES__|$$GEO_COUNTRIES|g" -e "s|__CROWDSEC_LAPI_KEY__|$$CROWDSEC_LAPI_KEY|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
     environment:
       HOME_SERVER: ${HOME_SERVER:?set HOME_SERVER in .env (copy .env.example)}
       DOMAIN: ${DOMAIN:?set DOMAIN in .env (copy .env.example)}
+      GEO_BLACKLIST: ${GEO_BLACKLIST:-false}
+      GEO_COUNTRIES: ${GEO_COUNTRIES:?set GEO_COUNTRIES in .env (copy .env.example)}
+      # Default-empty on purpose: the key only exists AFTER you first bring up
+      # the crowdsec engine and run `cscli bouncers add traefik-plugin`. A hard
+      # `:?` guard here would make that bootstrap impossible, because Compose
+      # interpolates the ENTIRE file before starting any single service — so even
+      # `docker compose up -d crowdsec` would trip it. The render step above
+      # instead prints a WARNING if this is still empty when Traefik's config is
+      # actually built.
+      CROWDSEC_LAPI_KEY: ${CROWDSEC_LAPI_KEY:-}
     volumes:
       - ./traefik-data/templates:/templates:ro
       - ./traefik-data/dynamic:/dynamic
@@ -39,29 +53,69 @@ services:
       - --api.dashboard=true
       - --api.insecure=true
 
-      # Entrypoints
+      # Entrypoints. Plain HTTP is redirected to HTTPS (this box now terminates
+      # TLS, so there's no reason to serve http://).
       - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
+      # This box is now a full L7 proxy in the path (not raw passthrough), so its
+      # own timeouts govern the connection. Mirror the home server's long-lived
+      # settings so the VPS doesn't cut WebSocket/SSE/long-poll streams before
+      # home would: no read/write cap, 600s idle.
+      - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=0
+      - --entrypoints.websecure.transport.respondingtimeouts.writetimeout=0
+      - --entrypoints.websecure.transport.respondingtimeouts.idletimeout=600s
 
       # File provider — routing lives in ./traefik-data/dynamic
       - --providers.file.directory=/etc/traefik/dynamic
       - --providers.file.watch=true
 
-      # Logging
+      # ACME — wildcard *.DOMAIN cert via DNS-01 (Cloudflare). The VPS terminates
+      # TLS now, so it holds this cert; the home server keeps its own.
+      - --certificatesresolvers.le.acme.dnschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+      # Skip the TXT-record propagation check and instead just wait a fixed 15s
+      # before telling ACME the challenge is ready (avoids flaky/slow-resolver
+      # propagation checks).
+      - --certificatesresolvers.le.acme.dnschallenge.propagation.disablechecks=true
+      - --certificatesresolvers.le.acme.dnschallenge.propagation.delaybeforechecks=15s
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL:?set ACME_EMAIL in .env}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+
+      # Plugins (downloaded at startup — needs outbound internet):
+      #   geoblock -> geofencing middleware ; bouncer -> CrowdSec L7 remediation
+      - --experimental.plugins.geoblock.modulename=github.com/PascalMinder/geoblock
+      - --experimental.plugins.geoblock.version=v0.3.3
+      - --experimental.plugins.bouncer.modulename=github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin
+      - --experimental.plugins.bouncer.version=v1.6.0
+
+      # Logging. Access log is JSON to a file so the CrowdSec engine can parse it
+      # for L7 attack detection (shared via the traefik-logs volume).
       - --log.level=INFO
       - --accesslog=true
+      - --accesslog.format=json
+      - --accesslog.filepath=/var/log/traefik/access.log
+    environment:
+      # DNS-01 challenge credentials for lego (Cloudflare). Swap for your
+      # provider's vars if you changed the resolver's provider above.
+      CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN:?set CF_DNS_API_TOKEN in .env}
     volumes:
       - ./traefik-data/dynamic:/etc/traefik/dynamic:ro
+      # ACME cert storage (acme.json is created here on first run).
+      - ./traefik-data/letsencrypt:/letsencrypt
+      # Access log, shared read-only with the CrowdSec engine.
+      - traefik-logs:/var/log/traefik
 
   # CrowdSec engine (the "brain"): reads logs, runs detection scenarios, and
-  # pulls the community blocklist. It does NOT block traffic itself — that's the
-  # host firewall-bouncer's job (installed separately; see README "CrowdSec").
+  # pulls the community blocklist. Enforcement happens in two places: the
+  # in-Traefik bouncer plugin (L7, per-request → 403) and the host firewall-
+  # bouncer (L3/L4, drops at nftables; installed separately, see README).
   #
-  # NOTE: this box does pure TLS passthrough, so Traefik never sees decrypted
-  # HTTP. That means CrowdSec here can't do L7 web-attack detection — it's used
-  # as an edge blocklist (community IPs) plus SSH brute-force detection from the
-  # host's auth log. Save the Traefik-log/L7 detection for the home server, where
-  # TLS is actually terminated.
+  # NOTE: now that Traefik TERMINATES TLS on this box, CrowdSec CAN do L7
+  # web-attack detection — it parses Traefik's JSON access log (crowdsecurity/
+  # traefik collection) on top of the community blocklist and SSH brute-force
+  # detection from the host's auth log.
   crowdsec:
     image: crowdsecurity/crowdsec:latest
     container_name: crowdsec
@@ -69,8 +123,8 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      # Pulled on first start: SSH brute-force + base linux scenarios.
-      COLLECTIONS: "crowdsecurity/sshd crowdsecurity/linux"
+      # Pulled on first start: SSH brute-force, base linux, and Traefik L7 scenarios.
+      COLLECTIONS: "crowdsecurity/sshd crowdsecurity/linux crowdsecurity/traefik"
       # Optional: enroll this engine in the CrowdSec console (app.crowdsec.net)
       # for a web UI. Put the key in .env, then uncomment:
       # ENROLL_INSTANCE_NAME: "traefik-vps"
@@ -79,8 +133,12 @@ services:
       # Host SSH auth log, read-only, so the sshd collection can spot brute-force.
       # Debian/Ubuntu path — on journald-only hosts this file won't exist (see README).
       - /var/log/auth.log:/var/log/auth.log:ro
-      # Custom acquisition (dropped into acquis.d so the image's defaults survive).
+      # Custom acquisitions (dropped into acquis.d so the image's defaults survive).
       - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.d/ssh.yaml:ro
+      - ./crowdsec/acquis-traefik.yaml:/etc/crowdsec/acquis.d/traefik.yaml:ro
+      # Traefik's JSON access log (written by Traefik into the shared volume),
+      # read-only, so the crowdsecurity/traefik collection can spot L7 attacks.
+      - traefik-logs:/var/log/traefik:ro
       # Persist config (registered bouncers + local creds) and the decisions DB.
       - crowdsec-config:/etc/crowdsec
       - crowdsec-data:/var/lib/crowdsec/data
@@ -92,11 +150,15 @@ services:
 volumes:
   crowdsec-config:
   crowdsec-data:
+  # Traefik writes its JSON access log here; CrowdSec reads it (both mount it).
+  traefik-logs:
 
-# NOTE: This box does pure TLS passthrough to the home server, so there is no
-# docker provider, no ACME/Let's Encrypt, and no certificate storage here.
-# TLS is terminated on the home server (DNS-01 certs).
+# NOTE: This box now TERMINATES TLS (bridging) and re-encrypts to the home
+# server, so it holds a wildcard *.DOMAIN cert (ACME DNS-01, stored in
+# ./traefik-data/letsencrypt). The home server still terminates its own TLS.
 #
 # If the container cannot reach your tailnet (100.x addresses) from the default
 # bridge network, switch to host networking: remove the `ports:` block above and
-# add `network_mode: host`.
+# add `network_mode: host`. Note: with host networking the Traefik→CrowdSec
+# plugin can no longer use `crowdsec:8080` — point crowdsecLapiHost at
+# 127.0.0.1:8081 in traefik-data/templates/poly.yml.tmpl instead.

@@ -1,0 +1,14 @@
+# Acquisition for the CrowdSec engine (mounted into /etc/crowdsec/acquis.d/).
+#
+# Feeds Traefik's JSON access log to CrowdSec so the crowdsecurity/traefik
+# collection can detect L7 web attacks (path traversal, scanners, bad bots,
+# HTTP brute-force) and hand the offending IPs to the bouncers.
+#
+# Traefik writes this file into the shared `traefik-logs` volume
+# (--accesslog.filepath in docker-compose.yml); CrowdSec mounts the same volume
+# read-only at /var/log/traefik. This works now that the VPS terminates TLS —
+# under the old pure-passthrough setup there was no decrypted HTTP to parse.
+filenames:
+  - /var/log/traefik/access.log
+labels:
+  type: traefik

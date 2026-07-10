@@ -1,43 +1,82 @@
 # TEMPLATE — do not edit the rendered copy in ../dynamic/poly.yml by hand.
 # On `docker compose up`, the `config` service renders this file into
-# ../dynamic/poly.yml, filling the HOME_SERVER and DOMAIN placeholders from .env
-# (the domain's dots are escaped as [.] so they stay literal in the regex rules).
+# ../dynamic/poly.yml, filling these placeholders from .env:
+#   __DOMAIN__          domain with dots escaped as [.]  (for the HostRegexp rules)
+#   __DOMAIN_RAW__      raw domain                       (for the wildcard cert SANs)
+#   __HOME_SERVER__     home server Tailscale IP
+#   __GEO_BLACKLIST__   false = allowlist / true = blocklist   (GeoBlock)
+#   __GEO_COUNTRIES__   comma-separated ISO codes               (GeoBlock, flow list)
+#   __CROWDSEC_LAPI_KEY__  bouncer API key for the CrowdSec plugin
 #
-# Routes all *.DOMAIN traffic to the home server over Tailscale.
-# TLS is terminated on the home server (certs via DNS-01 challenge), so this VPS
-# does pure TLS passthrough: it forwards the raw encrypted stream and never
-# decrypts anything. Routing is done off the TLS ClientHello SNI.
+# This box TERMINATES TLS (bridging): it decrypts the client's TLS, runs L7
+# checks (geofence + CrowdSec), then opens a SECOND TLS connection to the home
+# server (which still terminates its own TLS). The VPS holds a wildcard cert for
+# *.DOMAIN (Let's Encrypt via DNS-01); the home server keeps its own certs.
 
-tcp:
+http:
   routers:
-    poly-passthrough:
+    # All *.DOMAIN over HTTPS: terminate TLS here, geo-check, CrowdSec-check,
+    # then re-encrypt to the home server.
+    poly:
       entryPoints:
         - websecure
-      # Match any subdomain of $DOMAIN via the SNI in the TLS handshake
-      rule: 'HostSNIRegexp(`^.+\.__DOMAIN__$`)'
-      tls:
-        passthrough: true
+      rule: 'HostRegexp(`^.+\.__DOMAIN__$`)'
+      middlewares:
+        - geo-allow
+        - crowdsec
       service: home-server
+      tls:
+        certResolver: le
+        # Ask ACME for a single wildcard cert that covers every subdomain.
+        domains:
+          - main: "__DOMAIN_RAW__"
+            sans:
+              - "*.__DOMAIN_RAW__"
+
+  middlewares:
+    # Geofencing. blackListMode=false => only `countries` may connect (allowlist);
+    # =true => `countries` are blocked (blocklist). This VPS is the internet edge,
+    # so the request's real client IP is used directly (XForwardedForReverseProxy
+    # stays false — don't trust a client-supplied X-Forwarded-For here).
+    geo-allow:
+      plugin:
+        geoblock:
+          silentStartUp: false
+          allowLocalRequests: true
+          logAllowedRequests: false
+          logApiRequests: false
+          api: "https://get.geojs.io/v1/ip/country/{ip}"
+          apiTimeoutMs: 750
+          cacheSize: 1024
+          forceMonthlyUpdate: false
+          allowUnknownCountries: false
+          blackListMode: __GEO_BLACKLIST__
+          addCountryHeader: true
+          httpStatusCodeDeniedRequest: 403
+          countries: [__GEO_COUNTRIES__]
+
+    # CrowdSec L7 bouncer, live mode: every request's IP is checked against the
+    # CrowdSec engine's decisions (community blocklist + Traefik-log scenarios).
+    crowdsec:
+      plugin:
+        bouncer:
+          enabled: true
+          crowdsecMode: live
+          crowdsecLapiScheme: http
+          crowdsecLapiHost: crowdsec:8080
+          crowdsecLapiKey: "__CROWDSEC_LAPI_KEY__"
 
   services:
     home-server:
       loadBalancer:
+        # Re-encrypt to the home server, which terminates its own TLS on :443.
         servers:
-          - address: "__HOME_SERVER__:443"
+          - url: "https://__HOME_SERVER__:443"
+        serversTransport: home-tls
 
-# Optional: forward plain HTTP on :80 to the home server so that http:// links
-# still work (the home server issues the redirect to https). Plain HTTP has no
-# SNI, so this matches on the HTTP Host header instead. Remove this block if you
-# only want to serve HTTPS.
-http:
-  routers:
-    poly-http:
-      entryPoints:
-        - web
-      rule: 'HostRegexp(`^.+\.__DOMAIN__$`)'
-      service: home-http
-  services:
-    home-http:
-      loadBalancer:
-        servers:
-          - url: "http://__HOME_SERVER__:80"
+  serversTransports:
+    # The hop to the home server rides inside Tailscale (already WireGuard-
+    # encrypted), and the home server presents its own cert for its own names,
+    # so we don't verify it from here.
+    home-tls:
+      insecureSkipVerify: true
