@@ -32,4 +32,24 @@ services:
       # connection back here, where the client dials 127.0.0.1:443 (home Traefik).
       - -R
       - tcp://0.0.0.0:8443:127.0.0.1:443
+      # Second reverse listener for the tunnel health probe. VPS-side wstunnel
+      # binds 0.0.0.0:8444 and forwards back here to the always-200 responder
+      # below (127.0.0.1:8880). It rides the SAME WebSocket as :8443, so a clean
+      # 200 through it confirms this tunnel is alive end-to-end. On the VPS,
+      # wstunnel-health.DOMAIN routes to wstunnel:8444 (see poly.yml.tmpl).
+      - -R
+      - tcp://0.0.0.0:8444:127.0.0.1:8880
       - wss://${TUNNEL_HOST:?set TUNNEL_HOST}:443
+
+  # Tiny always-200 responder for the tunnel health probe. traefik/whoami returns
+  # 200 on any path. Published on 127.0.0.1:8880 so the host-networked wstunnel
+  # client above can dial it as the target of the :8444 reverse listener. Nothing
+  # else can reach it — it's bound to loopback only.
+  health:
+    image: traefik/whoami:latest
+    container_name: wstunnel-health
+    restart: unless-stopped
+    command:
+      - --port=8880
+    ports:
+      - "127.0.0.1:8880:8880"

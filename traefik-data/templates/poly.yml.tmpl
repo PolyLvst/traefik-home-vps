@@ -38,6 +38,28 @@ http:
         certResolver: le
         options: mtls-tunnel
 
+    # Tunnel health probe. A dedicated always-200 responder lives in the
+    # home-client stack and is exposed over a SECOND reverse listener on
+    # wstunnel:8444. A clean 200 here means the tunnel WebSocket is up end-to-end
+    # (client -> VPS -> tunnel -> home) — unlike wstunnel.DOMAIN, which only 400s a
+    # non-upgrade request and only proves the VPS server is alive. No mTLS here (so
+    # a plain HTTP monitor like Uptime Kuma can hit it and get 200), so unlike the
+    # control-plane router it isn't pinned to a known peer — geo-allow limits it to
+    # your country and crowdsec scores it like the public poly route, leaving no
+    # open, unscored route. Higher priority than the poly catch-all, whose
+    # HostRegexp would otherwise also match this host.
+    wstunnel-health:
+      entryPoints:
+        - websecure
+      rule: 'Host(`wstunnel-health.__DOMAIN_RAW__`)'
+      priority: 100
+      middlewares:
+        - geo-allow
+        - crowdsec
+      service: wstunnel-health
+      tls:
+        certResolver: le
+
     # All *.DOMAIN over HTTPS: terminate TLS here, geo-check, CrowdSec-check,
     # then re-encrypt to the home server.
     poly:
@@ -97,6 +119,14 @@ http:
       loadBalancer:
         servers:
           - url: "http://wstunnel:8080"
+
+    # Health responder reached over the second reverse listener
+    # (wstunnel:8444 -> tunnel -> home 127.0.0.1:8880 -> whoami). Plain http — the
+    # far end is a bare always-200 container with no TLS of its own.
+    wstunnel-health:
+      loadBalancer:
+        servers:
+          - url: "http://wstunnel:8444"
 
     home-server:
       loadBalancer:
