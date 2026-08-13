@@ -19,11 +19,20 @@ services:
     command:
       - sh
       - -c
-      - 'if [ -z "$$CROWDSEC_LAPI_KEY" ]; then echo "WARNING: CROWDSEC_LAPI_KEY is empty — the Traefik CrowdSec bouncer will fail to authenticate. Create it with: docker compose exec crowdsec cscli bouncers add traefik-plugin ; put it in .env, then re-run." >&2; fi; DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); sed -e "s|__DOMAIN_RAW__|$$DOMAIN|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" -e "s|__GEO_BLACKLIST__|$$GEO_BLACKLIST|g" -e "s|__GEO_COUNTRIES__|$$GEO_COUNTRIES|g" -e "s|__CROWDSEC_LAPI_KEY__|$$CROWDSEC_LAPI_KEY|g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
+      - 'if [ -z "$$CROWDSEC_LAPI_KEY" ]; then echo "WARNING: CROWDSEC_LAPI_KEY is empty — the Traefik CrowdSec bouncer will fail to authenticate. Create it with: docker compose exec crowdsec cscli bouncers add traefik-plugin ; put it in .env, then re-run." >&2; fi; DOMAIN_RE=$$(printf "%s" "$$DOMAIN" | sed "s/[.]/[.]/g"); EXCLUDE_RE=$$(printf "%s" "$$EXCLUDE_SUBS" | tr -d " " | tr "," "|"); sed -e "s|__DOMAIN_RAW__|$$DOMAIN|g" -e "s|__DOMAIN__|$$DOMAIN_RE|g" -e "s|__GEO_BLACKLIST__|$$GEO_BLACKLIST|g" -e "s|__GEO_COUNTRIES__|$$GEO_COUNTRIES|g" -e "s|__CROWDSEC_LAPI_KEY__|$$CROWDSEC_LAPI_KEY|g" -e "s@__EXCLUDE_SUBS__@$$EXCLUDE_RE@g" /templates/poly.yml.tmpl > /dynamic/poly.yml'
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN in .env (copy .env.example)}
       GEO_BLACKLIST: ${GEO_BLACKLIST:-false}
       GEO_COUNTRIES: ${GEO_COUNTRIES:?set GEO_COUNTRIES in .env (copy .env.example)}
+      # Subdomains to keep OFF the tunnel (comma-separated labels, e.g.
+      # "truenas,adguard,proxy"). The render above strips spaces and turns the
+      # commas into the regex alternation `truenas|adguard|proxy` — which is also
+      # why that one sed expression uses `@` as its delimiter instead of `|`.
+      # Unset/empty falls back to the sentinel `__none__`, which makes the
+      # `excluded` router's regex unmatchable — the feature is then simply off.
+      # Never let this substitute to an empty string: the rule would collapse to
+      # `^()\.DOMAIN$`.
+      EXCLUDE_SUBS: ${EXCLUDE_SUBS:-__none__}
       # Default-empty on purpose: the key only exists AFTER you first bring up
       # the crowdsec engine and run `cscli bouncers add traefik-plugin`. A hard
       # `:?` guard here would make that bootstrap impossible, because Compose

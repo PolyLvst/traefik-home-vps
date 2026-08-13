@@ -99,6 +99,35 @@ rule: 'HostRegexp(`^(.+\.)?__DOMAIN__$`)'
 Attach the `geo-allow` and `crowdsec` middlewares to any new router that should
 get edge filtering.
 
+## Excluding subdomains from the tunnel
+
+The `poly` router is a catch-all: *every* `*.DOMAIN` host that resolves to this
+VPS gets forwarded home. To keep specific hosts off the tunnel — LAN-only admin
+panels such as `truenas`, `adguard`, `proxy` — list their bare labels in `.env`:
+
+```bash
+EXCLUDE_SUBS=truenas,adguard,proxy      # comma-separated, no domain suffix
+docker compose up -d                    # re-renders the dynamic config
+```
+
+That feeds a higher-priority `excluded` router (`priority: 200`, beating the
+catch-all) whose `deny` middleware returns **403** at the edge. The request is
+rejected before the service is dialled, so it never crosses the tunnel and the
+home server never sees it. Leave `EXCLUDE_SUBS` empty/unset to disable — the
+render substitutes the sentinel `__none__`, which cannot match a real hostname.
+
+Verify after a re-render:
+
+```bash
+curl -sk -o /dev/null -w '%{http_code}\n' https://truenas.DOMAIN/   # 403
+curl -sk -o /dev/null -w '%{http_code}\n' https://app.DOMAIN/       # still proxied
+```
+
+> This is an *edge* control, not DNS. For defence in depth, also add specific DNS
+> records for those hosts (a specific record beats the `*` wildcard) pointing at
+> your LAN IP, so the traffic never reaches the VPS in the first place. The edge
+> rule then remains as the backstop if a record is ever re-pointed.
+
 ## Edge security (geofencing + CrowdSec L7)
 
 Because the VPS now decrypts traffic, two middlewares run on every `*.DOMAIN`

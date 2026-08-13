@@ -6,11 +6,19 @@
 #   __GEO_BLACKLIST__   false = allowlist / true = blocklist   (GeoBlock)
 #   __GEO_COUNTRIES__   comma-separated ISO codes               (GeoBlock, flow list)
 #   __CROWDSEC_LAPI_KEY__  bouncer API key for the CrowdSec plugin
+#   __EXCLUDE_SUBS__    subdomain labels NOT forwarded home. Written in .env as
+#                       EXCLUDE_SUBS=truenas,adguard,proxy (comma-separated); the
+#                       render turns it into the regex alternation
+#                       truenas|adguard|proxy that lands here.
 #
 # This box TERMINATES TLS (bridging): it decrypts the client's TLS, runs L7
 # checks (geofence + CrowdSec), then opens a SECOND TLS connection to the home
 # server (which still terminates its own TLS). The VPS holds a wildcard cert for
 # *.DOMAIN (Let's Encrypt via DNS-01); the home server keeps its own certs.
+#
+# NOT every *.DOMAIN host is forwarded: the `excluded` router below answers 403
+# for the hosts named in EXCLUDE_SUBS, so LAN-only admin panels stay off the
+# tunnel entirely. See that router for how, and README for why.
 #
 # The second hop no longer rides Tailscale. The home box dials OUT to
 # wstunnel.DOMAIN (wss/443) and opens a reverse tunnel; Traefik reaches
@@ -60,6 +68,40 @@ http:
       tls:
         certResolver: le
 
+    # Excluded subdomains — hosts that must NEVER be forwarded home, e.g. LAN-only
+    # admin panels (truenas, adguard, proxy=the home Traefik dashboard). Set
+    # EXCLUDE_SUBS in .env as a COMMA-separated list of bare labels; the render
+    # converts it to the pipe alternation below. When it is unset/empty the render
+    # substitutes the sentinel `__none__` — underscores are invalid in hostnames,
+    # so the rule can never match and this router is inert.
+    #
+    # It outranks the `poly` catch-all (priority 200 > poly's rule-length default),
+    # so a matching request is answered here and never reaches the tunnel. The
+    # `deny` middleware below rejects it with 403 before the service is dialled.
+    #
+    # Deliberately no geo-allow/crowdsec here: this router rejects EVERY client, so
+    # scoring the caller first would only add latency. Those requests still land in
+    # Traefik's access log, so the CrowdSec engine keeps scoring the source IP for
+    # its own scenarios — the bouncer check is what's skipped, not the detection.
+    #
+    # This is a HOST-level control. It cannot exclude a path on a host that is
+    # otherwise served (e.g. an admin UI sharing a hostname with a public status
+    # page) — split those onto their own hostname first, then exclude the old one.
+    #
+    # No `certResolver` here on purpose: the rule is a regexp, so Traefik cannot
+    # extract domains from it to drive ACME (it would just log a warning). `tls: {}`
+    # marks the router TLS-enabled and Traefik serves the wildcard *.DOMAIN cert
+    # that the `poly` router already requested, matched out of the cert store by SNI.
+    excluded:
+      entryPoints:
+        - websecure
+      rule: 'HostRegexp(`^(__EXCLUDE_SUBS__)\.__DOMAIN__$`)'
+      priority: 200
+      middlewares:
+        - deny
+      service: noop
+      tls: {}
+
     # All *.DOMAIN over HTTPS: terminate TLS here, geo-check, CrowdSec-check,
     # then re-encrypt to the home server.
     poly:
@@ -79,6 +121,19 @@ http:
               - "*.__DOMAIN_RAW__"
 
   middlewares:
+    # Unconditional reject, used by the `excluded` router. Traefik has no "deny"
+    # middleware, so this is an IP allowlist that nothing can satisfy: this box is
+    # the internet edge, so the source is a real public client IP and can never be
+    # 127.0.0.1. Every request through it gets a 403.
+    #
+    # The one caller that WOULD pass is something on the VPS itself dialling
+    # https://excluded-host/ over loopback. That's a local-root scenario, not a
+    # remote bypass, but don't treat this as a hard boundary for on-box processes.
+    deny:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+
     # Geofencing. blackListMode=false => only `countries` may connect (allowlist);
     # =true => `countries` are blocked (blocklist). This VPS is the internet edge,
     # so the request's real client IP is used directly (XForwardedForReverseProxy
@@ -112,6 +167,16 @@ http:
           crowdsecLapiKey: "__CROWDSEC_LAPI_KEY__"
 
   services:
+    # Black hole for the `excluded` router. Never actually dialled — the `deny`
+    # middleware answers 403 first — but a router must name a service, and a
+    # loadBalancer with an empty `servers` list is rejected as invalid config
+    # (which would drop the router entirely and let the `poly` catch-all take the
+    # host again). Port 1 inside the Traefik container has nothing listening.
+    noop:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:1"
+
     # WebSocket upgrade target for the tunnel control plane. `http` scheme — Traefik
     # transparently handles the ws upgrade; TLS/mTLS were already terminated at the
     # edge, so wstunnel listens plaintext ws on :8080 inside its container.
